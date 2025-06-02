@@ -229,7 +229,7 @@ __Poznámka:__ Účet je pouze pro čtení, pro změny použijte prosím webové
 
 ## Account [/accounts/{slug}/account.json]
 
-### Detail účtu [GET]
+### Detail účtu [GET /accounts/{slug}/accounst.json]
 
 + Parameters
     + slug (string, `applecorp`) ... Název účtu
@@ -484,6 +484,7 @@ __Poznámka:__ Číselné řady jsou pouze pro čtení, pro změny nebo vytvoře
 ## Subject [/accounts/{slug}/subjects/{id}.json]
 
 + Model (application/json)
+
     ```json
     {
         "id": 28,
@@ -527,7 +528,9 @@ __Poznámka:__ Číselné řady jsou pouze pro čtení, pro změny nebo vytvoře
         Content-Type: application/json
         User-Agent: YourApp (yourname@example.com)
         ```
-
+    
+    + Attributes (Subject)
+    
 + Response 200
 
     + Headers
@@ -565,6 +568,31 @@ __Poznámka:__ Číselné řady jsou pouze pro čtení, pro změny nebo vytvoře
             "html_url": "https://app.fakturoid.cz/applecorp/subjects/28",
             "url": "https://app.fakturoid.cz/api/v2/accounts/applecorp/subjects/28.json",
             "updated_at": "2012-06-02T09:34:47+02:00"
+        }
+        ```
+
+    + Schema
+    
+        ```
+        {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Subject",
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "integer",
+                    "description": "Unique identifier in fakturoid."
+                },
+                "custom_id": {
+                    "type": "integer",
+                    "description": "Identifier in your application"
+                },
+                "type": {
+                    "description": "Age in years which must be equal to or greater than zero.",
+                    "enum": ["customer", "supplier", "both"],
+                    "default": "customer"
+                }
+            }
         }
         ```
 
@@ -862,7 +890,6 @@ Při zadání nesprávného formátu data a času v parametru `since` nebo `upda
         ```
         Content-Type: application/json
         ETag: "75a303df11533fd269fd9ffa56d7b858"
-        Link: <https://app.fakturoid.cz/api/v2/accounts/applecorp/subjects.json?page=6>; rel="last", <https://app.fakturoid.cz/api/v2/accounts/applecorp/subjects.json?page=2>; rel="next"
         ```
 
     + Body
@@ -1920,7 +1947,7 @@ Parametry a jejich použití je stejné jako u seznamu faktur výše.
 
 + Response 400 (application/json)
 
-## Invoices Collection fulltext search [/accounts/{slug}/invoices/search.json{?query}]
+## Invoices Collection fulltext search [/accounts/{slug}/invoices/search.json{?query}{&page}]
 
 ### Fulltextové vyhledávání ve fakturách [GET]
 
@@ -5440,3 +5467,30 @@ Přihlášení probíhá stále přes HTTP BASIC AUTH. Nově je potřeba doplnit
 + Preference `PATCH` místo `PUT` pro částečnou aktualizaci resource
 + Vylepšená podpora pro použití `Etag` a `Last-Modified`
 + U země kontaktu se vynucuje ISO kód
+
+# Data Structures
+## Subject(object)
+ + id (number, readonly) - Unique identifier in Fakturoid
+ + custom_id (string) - Identifier in your application
+ + user_id (string, readonly) - User ID who created this document
+ + type (enum[string]) - Type of subject
+    - customer (default)
+    - supplier
+    - both
+ + name (string, required) - Name of the subject
+ + full_name (string) - Contact person name
+ + email (string) - Main email address receive invoice emails
+ + email_copy (string) - Email copy address to receive invoice emails
+ + phone (string) - Phone number
+ + web (string) - Web page
+ + street (string) - Street
+ + city (string) - City
+ + zip (string) - ZIP or postal code
+ + country (string) - country (ISO code) Default: Account setting
+ + has_delivery_address (boolean) - Enable delivery address. To be able to set delivery address in the attributes below this must be set to true. Upon setting this to false, the delivery address below is cleared.
+ + delivery_name (string) - Delivery address name
+ + delivery_street (string) - Delivery address street
+ + delivery_city (string) - Delivery address city
+ + delivery_zip (string) - Delivery address ZIP or postal code
+ + delivery_country (string) - Delivery address country (ISO code) Default: Account setting
+ + due (number) - Number of days until an invoice is due for this subject. Default: Inherit from account settings

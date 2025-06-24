@@ -13,27 +13,37 @@ from __future__ import annotations
 # Apify SDK - A toolkit for building Apify Actors. Read more at:
 # https://docs.apify.com/sdk/python
 from apify import Actor
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag, NavigableString
+from typing import cast, assert_type
+
 
 # HTTPX - A library for making asynchronous HTTP requests in Python. Read more at:
 # https://www.python-httpx.org/
 from httpx import AsyncClient
+import logging
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
+from langgraph.prebuilt.chat_agent_executor import AgentStructuredOutput
+from openapi_pydantic import OpenAPI
+from .utils import log_state
+from .tools import get_fakturoid_api_description_page
 
-def to_camel_case(text):
+def to_camel_case(text: str):
     s = text.replace("-", " ").replace("_", " ")
     s = s.split()
     if len(text) == 0:
         return text
     return s[0] + ''.join(i.capitalize() for i in s[1:])
 
+
 async def parse_page(client: AsyncClient, url: str):
     Actor.log.info(f'Sending a request to {url}')
 
     response = await client.get(url)
     # Parse the HTML content using Beautiful Soup and lxml parser.
-    soup = BeautifulSoup(response.content, 'lxml')
+    soup: BeautifulSoup = BeautifulSoup(response.content, 'lxml')
 
-    api_article_div = soup.find(class_="api-article")
+    api_article_div = soup.find(class_="api-article") 
     group_name = api_article_div.parent.h1.text
 
     attributes_heading = api_article_div.find(id="attributes")
@@ -60,7 +70,7 @@ async def parse_page(client: AsyncClient, url: str):
         'properties': properties
     }
     schemas = {
-        f'{to_camel_case(group_name)}.Attributes': schema_dict
+        f'{to_camel_case(group_name)}': schema_dict
     }
 
     if required:
@@ -86,11 +96,14 @@ def dereference(object_name: str):
     return object_name.lstrip('#')
 
 
-def parse_attributes_table(table):
+def parse_attributes_table(table: BeautifulSoup) -> tuple[dict, list]:
     required = []
     properties = {}
-    
+
     cols = ['vis', 'attribute', 'type', 'Description']
+    
+    assert table.tbody, "Table should have a tbody element"
+    
     for tr in table.tbody.find_all('tr'):
         row_items = [tag for tag in tr.children if tag.name]
         vis_td, attribute_td, type_td, desc_td = row_items
@@ -124,6 +137,7 @@ def parse_attributes_table(table):
         properties[prop_name] = {
             "type": prop_type,
             "description": desc_td.get_text(),
+            "readOnly": readonly
         }
         if items:
             properties[prop_name]['items'] = items
@@ -144,6 +158,9 @@ async def main() -> None:
 
 
     async with Actor:
+        # Charge for Actor start
+        await Actor.charge('actor-start')
+
         # Retrieve the input object for the Actor. The structure of input is defined in input_schema.json.
         actor_input = await Actor.get_input() or {'url': 'https://www.fakturoid.cz'}
         baseurl = actor_input.get('url')
@@ -155,14 +172,14 @@ async def main() -> None:
         schemas = {}
 
         openapi_info = {
-            "title": "Webscraped Fakturoid V3 API",
-            "description": "This is websraped definition of Fakturoid.",
+            "title": "Web-scraped Fakturoid V3 API",
+            "description": "This is web-scraped definition of Fakturoid.",
             "contact": {
                 "name": "Jaroslav Henner",
                 "url": "https://github.com/jarovo/fakturoid-api/",
             },
             "license": {
-                "name": "Webscraped Fakturoid API V3 © 2025 by Jaroslav Henner is licensed under CC BY-SA 4.0. To view a copy of this license, visit https://creativecommons.org/licenses/by-sa/4.0/",
+                "name": "Web-scraped Fakturoid API V3 © 2025 by Jaroslav Henner is licensed under CC BY-SA 4.0. To view a copy of this license, visit https://creativecommons.org/licenses/by-sa/4.0/",
                 "url": "https://creativecommons.org/licenses/by-sa/4.0/",
             },
             "version": "3.0.0-draft",
@@ -173,13 +190,13 @@ async def main() -> None:
             "schemas": schemas
         }
 
-        openapi = {
+        openapi  = {
             "openapi": "3.0.4",
             "info": openapi_info,
-            "servers": {
+            "servers": [ {
                 "url": "https://app.fakturoid.cz/api/v3",
-                "description": 'Production Fakturoid server',
-            },
+                "description": 'Production Fakturoid server'
+            }],
             "externalDoc": {
                 "description": "Published documentation",
                 "url": "https://www.fakturoid.cz/api/v3",
@@ -205,3 +222,53 @@ async def main() -> None:
                         openapi_components["schemas"][cls_name] = definition
 
         await Actor.push_data(openapi)
+
+
+async def main() -> None:
+    """Parse the URL using LLM."""
+    actor_input = await Actor.get_input()
+    query = actor_input.get('query')
+    model_name = actor_input.get('modelName', 'gpt-4o-mini')
+    if actor_input.get('debug', False):
+        Actor.log.setLevel(logging.DEBUG)
+    if not query:
+        msg = 'Missing "query" attribute in input!'
+        raise ValueError(msg)
+
+    llm = ChatOpenAI(model=model_name)
+
+    # Create the ReAct agent graph
+    # see https://langchain-ai.github.io/langgraph/reference/prebuilt/?h=react#langgraph.prebuilt.chat_agent_executor.create_react_agent
+    tools = [get_fakturoid_api_description_page]
+    graph = create_react_agent(llm, tools, response_format=OpenAPI)
+
+    inputs: dict = {'messages': [('user', query)]}
+    response: OpenAPI | None = None
+    last_message: str | None = None
+    async for state in graph.astream(inputs, stream_mode='values'):
+        log_state(state)
+        if 'structured_response' in state:
+            response = state['structured_response']
+            last_message = state['messages'][-1].content
+            break
+
+    if not response or not last_message:
+        Actor.log.error('Failed to get a response from the ReAct agent!')
+        await Actor.fail(status_message='Failed to get a response from the ReAct agent!')
+        return
+
+    # Charge for task completion
+    await Actor.charge('task-completed')
+
+    # Push results to the key-value store and dataset
+    store = await Actor.open_key_value_store()
+    await store.set_value('response.txt', last_message)
+    Actor.log.info('Saved the "response.txt" file into the key-value store!')
+
+    await Actor.push_data(
+        {
+            'response': last_message,
+            'structured_response': response.dict() if response else {},
+        }
+    )
+    Actor.log.info('Pushed the into the dataset!')

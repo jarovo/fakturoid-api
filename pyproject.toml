@@ -1,0 +1,21 @@
+[project]
+name = "fakturoid-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "apify < 3.0",
+    "beautifulsoup4[lxml]",
+    "httpx",
+    "types-beautifulsoup4",
+    "langchain-openai",
+    "langgraph",
+    "openapi-pydantic"
+]
+
+[project.scripts]
+fakturoid_api_scraper = "fakturoid_api_scraper.main:main_cli"
+
+[tool.uv]
+package = true

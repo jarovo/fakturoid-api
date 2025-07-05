@@ -14,7 +14,7 @@ from __future__ import annotations
 # https://docs.apify.com/sdk/python
 from apify import Actor
 from bs4 import BeautifulSoup, Tag, NavigableString
-from typing import cast, assert_type
+from typing import cast, assert_type, Dict, Tuple
 
 
 # HTTPX - A library for making asynchronous HTTP requests in Python. Read more at:
@@ -23,10 +23,11 @@ from httpx import AsyncClient
 import logging
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
-from langgraph.prebuilt.chat_agent_executor import AgentStructuredOutput
-from openapi_pydantic import OpenAPI
+from openapi_pydantic import OpenAPI, Info, Server, ExternalDocumentation, PathItem
+import openapi_pydantic as opy
 from .utils import log_state
 from .tools import get_fakturoid_api_description_page
+
 
 def to_camel_case(text: str):
     s = text.replace("-", " ").replace("_", " ")
@@ -36,7 +37,7 @@ def to_camel_case(text: str):
     return s[0] + ''.join(i.capitalize() for i in s[1:])
 
 
-async def parse_page(client: AsyncClient, url: str):
+async def parse_page(client: AsyncClient, url: str, openapi: OpenAPI):
     Actor.log.info(f'Sending a request to {url}')
 
     response = await client.get(url)
@@ -61,32 +62,20 @@ async def parse_page(client: AsyncClient, url: str):
     Actor.log.info(f"Found subobjects to parse {subobjects_headings_tags}")
     Actor.log.info(f"Found requests to parse {requests_headings_tags}")
 
-    properties, required = parse_attributes_table(attribs_table)
+    parse_attributes_table(attribs_table, group_name, openapi)
 
     # https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.0.4.md#components-object
-    
-    schema_dict = {
-        'type': "object",
-        'properties': properties
-    }
-    schemas = {
-        f'{to_camel_case(group_name)}': schema_dict
-    }
-
-    if required:
-        schema_dict['required'] = required
-        
-    return schemas
 
 
-SIMPLE_TYPES = {
-    'String': ("string", None),
-    'Integer': ("integer", None),
-    'Boolean': ("boolean", None),
-    'DateTime': ("string", "date-time"),
-    'Datetime': ("string", "date-time"),
-    'Date': ("string", "date"),
-    'Decimal': ("number", "decimal")
+
+SIMPLE_TYPES: Dict[str, Tuple[opy.DataType, str|None]] = {
+    'String': (opy.DataType.STRING, None),
+    'Integer': (opy.DataType.INTEGER, None),
+    'Boolean': (opy.DataType.BOOLEAN, None),
+    'DateTime': (opy.DataType.STRING, "date-time"),
+    'Datetime': (opy.DataType.STRING, "date-time"),
+    'Date': (opy.DataType.STRING, "date"),
+    'Decimal': (opy.DataType.NUMBER, "decimal")
 }
 
 
@@ -96,9 +85,13 @@ def dereference(object_name: str):
     return object_name.lstrip('#')
 
 
-def parse_attributes_table(table: BeautifulSoup) -> tuple[dict, list]:
-    required = []
-    properties = {}
+def parse_attributes_table(table: BeautifulSoup, group_name: str, openapi: opy.OpenAPI) -> None:
+    schema = opy.Schema(
+        type=opy.DataType.OBJECT,
+        description="This schema is web-scraped from Fakturoid API documentation.",
+        properties={},
+        required=[],
+    )
 
     cols = ['vis', 'attribute', 'type', 'Description']
     
@@ -112,41 +105,41 @@ def parse_attributes_table(table: BeautifulSoup) -> tuple[dict, list]:
         if vis_td.div:
             readonly = vis_td.div.attrs['title'] == "Read-only attribute"
             if vis_td.div.attrs['title'] == "Required attribute":
-                required.append(prop_name)
+                assert schema.required is not None, "Schema should have a required list"
+                schema.required.append(prop_name)
 
         soup_type_strings = list(type_td.code.strings)
 
         prop_type = None
-        items = []
+        items = None
         prop_format = None
         if len(soup_type_strings) == 3 and soup_type_strings == ['Array[', 'Object', ']']:
             prop_obj_type = dereference(type_td.code.a.attrs['href'])
-            prop_type = 'array'
-            items = {'$ref': f'#/components/schemas/{prop_obj_type}'}
-        elif len(soup_type_strings) == 1: 
+            prop_type = opy.DataType.ARRAY
+            items = opy.Reference(ref=f'#/components/schemas/{prop_obj_type}')
+        elif len(soup_type_strings) == 1:
             resolved_type = SIMPLE_TYPES.get(soup_type_strings[0], None)
             if resolved_type == None:
                 Actor.log.error(f"Unknow type {soup_type_strings[0]}")
                 prop_format = soup_type_strings[0].lower()
-                prop_type = 'string'
+                prop_type = opy.DataType.STRING
             else:
                 prop_type, prop_format = resolved_type
         else:
             Actor.log.error(f"Couldn't make sense of {type_td}")
 
-        properties[prop_name] = {
-            "type": prop_type,
-            "description": desc_td.get_text(),
-            "readOnly": readonly
-        }
+        assert schema.properties is not None, "Schema should have a properties dict"
+        schema.properties[prop_name] = opy.Schema(
+            type=prop_type,
+            description=desc_td.get_text(),
+            readOnly=readonly,
+        )
         if items:
-            properties[prop_name]['items'] = items
+            schema.properties[prop_name].items = items
         if prop_format:
-            properties[prop_name]['format'] = prop_format
-
+            schema.properties[prop_name].schema_format = prop_format
         
-    return properties, required
-        
+    openapi.components.schemas[group_name] = schema
 
 async def main() -> None:
     """Define a main entry point for the Apify Actor.
@@ -169,40 +162,39 @@ async def main() -> None:
 
         firsturl = f'{baseurl}/api/v3'
 
-        schemas = {}
+        schemas: Dict[str, opy.Schema] = {}
 
-        openapi_info = {
-            "title": "Web-scraped Fakturoid V3 API",
-            "description": "This is web-scraped definition of Fakturoid.",
-            "contact": {
-                "name": "Jaroslav Henner",
-                "url": "https://github.com/jarovo/fakturoid-api/",
-            },
-            "license": {
-                "name": "Web-scraped Fakturoid API V3 © 2025 by Jaroslav Henner is licensed under CC BY-SA 4.0. To view a copy of this license, visit https://creativecommons.org/licenses/by-sa/4.0/",
-                "url": "https://creativecommons.org/licenses/by-sa/4.0/",
-            },
-            "version": "3.0.0-draft",
-        }
+        openapi_info = opy.Info(
+            title="Web-scraped Fakturoid V3 API",
+            description="This is web-scraped definition of Fakturoid.",
+            contact=opy.Contact(
+                name="Jaroslav Henner",
+                url="https://github.com/jarovo/fakturoid-api/",
+            ),
+            license=opy.License(
+                name="Web-scraped Fakturoid API V3 © 2025 by Jaroslav Henner is licensed under CC BY-SA 4.0. To view a copy of this license, visit https://creativecommons.org/licenses/by-sa/4.0/",
+                url="https://creativecommons.org/licenses/by-sa/4.0/",
+            ),
+            version="3.0.0-draft",
+        )
 
 
-        openapi_components = {
-            "schemas": schemas
-        }
+        openapi_components = opy.Components(
+            schemas=schemas
+        )
 
-        openapi  = {
-            "openapi": "3.0.4",
-            "info": openapi_info,
-            "servers": [ {
-                "url": "https://app.fakturoid.cz/api/v3",
-                "description": 'Production Fakturoid server'
-            }],
-            "externalDoc": {
-                "description": "Published documentation",
-                "url": "https://www.fakturoid.cz/api/v3",
-            },
-            "components": openapi_components
-        }
+        openapi  = opy.OpenAPI(
+            info=openapi_info,
+            servers=[opy.Server(
+                url="https://app.fakturoid.cz/api/v3",
+                description='Production Fakturoid server'
+            )],
+            externalDocs=opy.ExternalDocumentation(
+                description="Published documentation",
+                url="https://www.fakturoid.cz/api/v3"
+            ),
+            components=openapi_components
+        )
 
         # Create an asynchronous HTTPX client for making HTTP requests.
         async with AsyncClient() as client:
@@ -215,60 +207,15 @@ async def main() -> None:
 
             for li in soup.find_all('li',  class_='pb-1'):
                 path = li.a['href']
-                schemas = await parse_page(client=client, url=f'{baseurl}{path}')
-                if schemas:
-                    for cls_name, definition in schemas.items():
-                        assert cls_name not in openapi_components["schemas"]
-                        openapi_components["schemas"][cls_name] = definition
+                await parse_page(client=client, url=f'{baseurl}{path}', openapi=openapi)
 
-        await Actor.push_data(openapi)
+        await Actor.push_data(openapi.model_dump_json(indent=2, exclude_none=True))
 
 
-async def main() -> None:
-    """Parse the URL using LLM."""
-    actor_input = await Actor.get_input()
-    query = actor_input.get('query')
-    model_name = actor_input.get('modelName', 'gpt-4o-mini')
-    if actor_input.get('debug', False):
-        Actor.log.setLevel(logging.DEBUG)
-    if not query:
-        msg = 'Missing "query" attribute in input!'
-        raise ValueError(msg)
+def main_cli() -> None:
+    """Define a main entry point for the Apify Actor.
 
-    llm = ChatOpenAI(model=model_name)
-
-    # Create the ReAct agent graph
-    # see https://langchain-ai.github.io/langgraph/reference/prebuilt/?h=react#langgraph.prebuilt.chat_agent_executor.create_react_agent
-    tools = [get_fakturoid_api_description_page]
-    graph = create_react_agent(llm, tools, response_format=OpenAPI)
-
-    inputs: dict = {'messages': [('user', query)]}
-    response: OpenAPI | None = None
-    last_message: str | None = None
-    async for state in graph.astream(inputs, stream_mode='values'):
-        log_state(state)
-        if 'structured_response' in state:
-            response = state['structured_response']
-            last_message = state['messages'][-1].content
-            break
-
-    if not response or not last_message:
-        Actor.log.error('Failed to get a response from the ReAct agent!')
-        await Actor.fail(status_message='Failed to get a response from the ReAct agent!')
-        return
-
-    # Charge for task completion
-    await Actor.charge('task-completed')
-
-    # Push results to the key-value store and dataset
-    store = await Actor.open_key_value_store()
-    await store.set_value('response.txt', last_message)
-    Actor.log.info('Saved the "response.txt" file into the key-value store!')
-
-    await Actor.push_data(
-        {
-            'response': last_message,
-            'structured_response': response.dict() if response else {},
-        }
-    )
-    Actor.log.info('Pushed the into the dataset!')
+    This function is executed when the script is run directly, e.g. `python -m src.fakturoid_api_scraper`.
+    """
+    import asyncio
+    asyncio.run(main())

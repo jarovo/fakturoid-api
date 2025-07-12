@@ -11,7 +11,7 @@ dependencies = [
     "types-beautifulsoup4",
     "langchain-openai",
     "langgraph",
-    "openapi-pydantic"
+    "openapi-pydantic",
 ]
 
 [project.scripts]
@@ -19,3 +19,12 @@ fakturoid_api_scraper = "fakturoid_api_scraper.main:main_cli"
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+openapi-pydantic = { path = "../openapi-pydantic" }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.4.1",
+    "pytest-recording>=0.13.4",
+]

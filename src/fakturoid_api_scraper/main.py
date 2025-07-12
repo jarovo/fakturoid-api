@@ -24,10 +24,17 @@ import logging
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 from openapi_pydantic import OpenAPI, Info, Server, ExternalDocumentation, PathItem
-import openapi_pydantic as opy
+import openapi_pydantic.v3.v3_1 as opy
 from fakturoid_api_scraper.utils import log_state
 from fakturoid_api_scraper.tools import get_fakturoid_api_description_page
 from dataclasses import dataclass
+
+
+API_BASEURL = "https://app.fakturoid.cz/api/v3"
+
+
+class ParseError(Exception):
+    pass
 
 
 def to_camel_case(text: str):
@@ -38,90 +45,91 @@ def to_camel_case(text: str):
     return s[0] + ''.join(i.capitalize() for i in s[1:])
 
 
+def parse_table(table: Tag) -> Dict[str, opy.Schema]:
+    params: Dict[str, opy.Schema] = {}
+    rows = table.find_all('tr')
+    for row in rows:
+        cols = row.find_all('td')
+        if len(cols) >= 2:
+            param_name = cols[0].text.strip()
+            param_description = cols[1].text.strip()
+            params[param_name] = param_description
+            Actor.log.info(f"Found parameter {param_name} with description: {param_description}")
+    return params
+
+
+def parse_path_item(button_tag: Tag) -> Tuple[str, str] | None:
+    """Parses a button tag to extract the HTTP path and operations."""
+
+    operation: str
+    path: str
+
+    if method_tag := button_tag.find('code'):
+        operation = method_tag.text.strip().lower()
+        if operation not in ('get', 'post', 'patch', 'delete'):
+            raise ParseError(f"Unexpected method {operation} in {button_tag}")
+        path = method_tag.find_next_sibling('code').text.strip()
+        Actor.log.info(f"Found requests: {operation} {path}")
+        return operation, path
+    elif method_tag := button_tag.find(string="Payload example"):
+        raise ParseError(f"Webhook-delivery context found in {button_tag}")
+    else:
+        raise ParseError(f"Method tag not found in {button_tag}")
+
 
 @dataclass
-class Method:
-    title: str
+class Path:
+    summary: str
     description: str
     operation: str
     path: str
 
     @classmethod
-    def parse(cls, title_tag: Tag, openapi: OpenAPI) -> Iterator[Self]:
-        """Returns the next sibling of a tag that is not a NavigableString."""
-        title = title_tag.text.strip()
-        description = None
-        operation = None
-        path = None
+    def parse(cls, title_tag: Tag, openapi: OpenAPI) -> Self:
+        title: str = title_tag.text.strip()
+        description: str
+        operation: str
+        path: str
 
         Actor.log.info(f"Parsing request {title}")
-        for tag in title_tag.find_next_siblings():
-            print(tag)
-            if isinstance(tag, NavigableString):
-                continue
-            elif isinstance(tag, Tag):
-                if tag.name in ('ul', 'p') or 'table-scroll' in tag.get('class', []):
-                    Actor.log.info(f"Found request description: {tag.text.strip()}")
-                    description = tag.text.strip()
-                elif tag.name == 'div':
-                    Actor.log.info(f"Found request div: {tag}")
-                    request_button = tag.find('button')
-                    assert request_button, "Request button should be present in the div"
-                    if method_tag := request_button.find('code'):
-                        operation = method_tag.text.strip().lower()
-                        if operation not in ('get', 'post', 'patch', 'delete'):
-                            Actor.log.warning(f"Unexpected method {operation} in request {title}")
-                            continue
-                        path = method_tag.find_next_sibling('code').text.strip()
-                        Actor.log.info(f"Found requests: {title} {operation} {path}")
-                    elif example_lead := request_button.find('span', text='Payload example'):
-                        if example_tag := example_lead.find_next('div', attrs={'data-toggle-content-target': 'content'}):
-                            description += f"\nPayload example:" + str(example_tag)
-                            continue
-                        else:
-                            Actor.log.warning(f"Payload example not found in request {title}")
-                elif tag.name == 'h3' and tag.text.strip() == 'Request':
-                    Actor.log.info(f"Found request title: {title}")
-                    # Continue to the next tag, which should be the description or div with method and path
-                    continue
-                elif tag.name == "h3" and tag.text.strip() == "Response":
-                    Actor.log.info(f"Found response for request {title} {operation} {path}")
-                    # We are done with the request, yield it
-                    if title and description and operation and path:
-                        yield cls(title=title, description=description, operation=operation, path=path)
-                    break
-                elif tag.name == "h3" and tag.text.strip() == "Payload Content":
-                    Actor.log.info(f"Found payload content for request {title} {operation} {path}")
-                    description += tag.text.strip() +str(tag.next_sibling)
-                elif tag.name == "h2":
-                    Actor.log.warning(f"Found h2 tag {tag} in request {title}")
-                    if title and description and operation and path:
-                        yield cls(title=title, description=description, operation=operation, path=path)
-                    break
-                else:
-                    Actor.log.warning(f"Unexpected tag {tag} in request {title}")
-                    break
-        else:
-            Actor.log.warning(f"Request {title} not fully parsed")
 
-    def fill_openapi(self, openapi: OpenAPI, group_name: str) -> None:
+        if description_tag := title_tag.find_next('ul'):
+            description = description_tag.text.strip()
+        else:
+            Actor.log.warning(f"Description not found for request {title}")
+            description = "No description provided."
+            
+        toggle_content_tag = title_tag.find_next('div', attrs={'data-controller': 'toggle-content'})
+        assert isinstance(toggle_content_tag, Tag), "Toggle content tag should be a Tag instance"
+
+        request_button = toggle_content_tag.find('button')
+        assert isinstance(request_button, Tag), "Request button should be a Tag instance"
+        operation, path = parse_path_item(request_button)
+
+        request_description_div_tag = toggle_content_tag.find('div', attrs={'data-toggle-content-target': 'content'})
+        assert isinstance(request_description_div_tag, Tag), "Request description div tag should be a Tag instance"
+
+        return cls(summary=title, description=description, operation=operation, path=path)
+
+    def fill_openapi(self, openapi: OpenAPI, tag_name:str, entity_name: str) -> None:
         """Fills the OpenAPI object with the method data."""
-        Actor.log.info(f"Filling OpenAPI with {self.operation} {self.path} for group {group_name}")
+        Actor.log.info(f"Filling OpenAPI with {self.operation} {self.path} for {tag_name} and {entity_name} entity.")
 
         if path_item := openapi.paths.get(self.path, opy.PathItem()):
+
             if operation := getattr(path_item, self.operation.lower(), None):
                 raise ValueError(f"Operation {self.operation} {self.path} already exists.")
 
             operation = opy.Operation(
-                summary=self.title,
+                summary=self.summary,
                 description=self.description,
-                tags=[group_name],
+                tags=[entity_name],
                 responses={
                     "200": opy.Response(
                         description="Successful response",
                         content={
                             "application/json": opy.MediaType(
-                                schema=opy.Reference(ref=f'#/components/schemas/{group_name}')
+                                schema=opy.Reference(ref=f'#/components/schemas/{entity_name}')
                             )
                         }
                     )
@@ -131,17 +139,13 @@ class Method:
 
         openapi.paths[self.path] = path_item
 
-async def parse_page(client: AsyncClient, url: str, openapi: OpenAPI):
-    Actor.log.info(f'Sending a request to {url}')
 
-    response = await client.get(url)
-    # Parse the HTML content using Beautiful Soup and lxml parser.
-    soup: BeautifulSoup = BeautifulSoup(response.content, 'lxml')
+async def parse_article(article_tag: Tag, openapi: OpenAPI) -> None:
+    """Parses an article tag to extract the API path and operations."""
+    Actor.log.info(f"Parsing article {article_tag}")
+    title = article_tag.parent.h1.text.strip()
 
-    api_article_div = soup.find(class_="api-article") 
-    group_name = api_article_div.parent.h1.text
-
-    attributes_heading = api_article_div.find(id="attributes")
+    attributes_heading = article_tag.find(id="attributes")
     if not attributes_heading:
         return None
 
@@ -156,13 +160,26 @@ async def parse_page(client: AsyncClient, url: str, openapi: OpenAPI):
     Actor.log.info(f"Found subobjects to parse {subobjects_headings_tags}")
     Actor.log.info(f"Found requests to parse {requests_headings_tags}")
 
-    parse_attributes_table(attribs_table, group_name, openapi)
+    parse_attributes_table(attribs_table, title, openapi)
     # https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.0.4.md#components-object
     for heading_tag in requests_headings_tags:
         assert isinstance(heading_tag, Tag), "Heading tag should be a Tag instance"
-        method = [m for m in Method.parse(heading_tag, openapi) if m is not None]
-        for m in method:
-            m.fill_openapi(openapi, group_name)
+        try:
+            method = Path.parse(heading_tag, openapi)
+            method.fill_openapi(openapi, heading_tag.text.strip(), title)
+        except ParseError as e:
+            Actor.log.error(f"Failed to parse {heading_tag}: {e}")
+
+
+async def parse_page(client: AsyncClient, url: str, openapi: OpenAPI):
+    Actor.log.info(f'Sending a request to {url}')
+
+    response = await client.get(url)
+    # Parse the HTML content using Beautiful Soup and lxml parser.
+    soup: BeautifulSoup = BeautifulSoup(response.content, 'lxml')
+
+    api_article_div = soup.find(class_="api-article") 
+    await parse_article(api_article_div, openapi)
 
 SIMPLE_TYPES: Dict[str, Tuple[opy.DataType, str|None]] = {
     'String': (opy.DataType.STRING, None),
@@ -216,7 +233,7 @@ def parse_attributes_table(table: BeautifulSoup, group_name: str, openapi: opy.O
         elif len(soup_type_strings) == 1:
             resolved_type = SIMPLE_TYPES.get(soup_type_strings[0], None)
             if resolved_type == None:
-                Actor.log.error(f"Unknow type {soup_type_strings[0]}")
+                Actor.log.error(f"Unknown type {soup_type_strings[0]}")
                 prop_format = soup_type_strings[0].lower()
                 prop_type = opy.DataType.STRING
             else:
@@ -236,6 +253,32 @@ def parse_attributes_table(table: BeautifulSoup, group_name: str, openapi: opy.O
             schema.properties[prop_name].schema_format = prop_format
         
     openapi.components.schemas[group_name] = schema
+    
+
+def parse_h3_table(h3_tag: Tag, openapi: OpenAPI) -> str:
+    """Parses an h3 tag to extract the API path and operations."""
+    Actor.log.info(f"Parsing h3 {h3_tag}")
+    title = h3_tag.text.strip()
+    table = h3_tag.find_next('table')
+    if not table:
+        Actor.log.warning(f"No table found for {title}")
+        return
+
+    params = parse_table(table)
+    if not params:
+        Actor.log.warning(f"No parameters found in table for {title}")
+        return
+
+    schema = opy.Schema(
+        type=opy.DataType.OBJECT,
+        description="This schema is web-scraped from Fakturoid API documentation.",
+        properties=params,
+        required=list(params.keys())
+    )
+    
+    openapi.components.schemas[title] = schema
+
+    return title
 
 async def main() -> None:
     """Define a main entry point for the Apify Actor.
@@ -276,7 +319,13 @@ async def main() -> None:
 
 
         openapi_components = opy.Components(
-            schemas=schemas
+            schemas=schemas,
+            securitySchemes={
+                'OAuth2': opy.SecurityScheme(type='oauth2',
+                                             description='OAuth2 security scheme for Fakturoid API',
+                                             flows=opy.OAuthFlows(
+                                                 clientCredentials=opy.OAuthFlow(tokenUrl=f'{API_BASEURL}/oauth/token', scopes={})))
+            }
         )
 
         openapi  = opy.OpenAPI(
@@ -291,6 +340,7 @@ async def main() -> None:
             ),
             components=openapi_components,
             paths={},
+            security=[dict(OAuth2=[])],
         )
 
         # Create an asynchronous HTTPX client for making HTTP requests.

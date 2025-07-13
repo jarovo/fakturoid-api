@@ -14,7 +14,7 @@ from __future__ import annotations
 # https://docs.apify.com/sdk/python
 from apify import Actor
 from bs4 import BeautifulSoup, Tag, NavigableString, ResultSet
-from typing import cast, assert_type, Dict, Tuple, Iterator, Self
+from typing import cast, assert_type, Dict, Tuple, Iterator, Self, List
 
 
 # HTTPX - A library for making asynchronous HTTP requests in Python. Read more at:
@@ -77,12 +77,85 @@ def parse_path_item(button_tag: Tag) -> Tuple[str, str] | None:
         raise ParseError(f"Method tag not found in {button_tag}")
 
 
+class TableRow:
+    def __init__(self, tag: Tag):
+        assert tag.name == 'tr', "TableRow should be initialized with a <tr> tag"
+        self.tag = tag
+
+    def __iter__(self) -> Iterator[Tag]:
+        for tag in self.tag.contents:
+            if isinstance(tag, Tag):
+                assert tag.name in ('td', 'th'), "TableRow should only contain <td> or <th> tags"
+                yield tag.text.strip()
+
+class Table:
+    def __init__(self, tag: Tag):
+        assert tag.name == 'table', "Table should be initialized with a <table> tag"
+        self.tag = tag
+
+    def thead_items(self):
+        thead_tag: Tag = self.tag.find('thead')
+        thead_tr_tag: Tag = thead_tag.find('tr')
+
+        for th in thead_tr_tag.find_all('th'):
+            yield th.text.strip()
+
+    def __iter__(self) -> Iterator[TableRow]:
+        tbody_tag: Tag = self.tag.find('tbody')
+        yield from (TableRow(row) for row in tbody_tag.find_all('tr'))
+
+
+
+PARAMETERS_IN_TABLE = {
+    'URL Parameters': 'path',
+    'Query Parameters': 'query',
+}
+
+
+def parse_request_description_div_tag(request_description_div_tag: Tag, openapi: OpenAPI) -> None:
+    heading: str
+    table: Tag
+    parameters: List[opy.Parameter] = []
+
+    for h4_tag in request_description_div_tag.find_all('h4'):    
+        heading = h4_tag.text.strip()
+
+        param_in = PARAMETERS_IN_TABLE.get(heading, None)
+        if not param_in:
+            Actor.log.warning(f"Unknown heading {heading} in request description div tag.")
+            continue
+
+        Actor.log.info(f"Found heading: {heading}")
+
+        div = h4_tag.find_next('div')
+        table = div.find('table')
+        Actor.log.info(f"Found {heading} table")
+        table = Table(table)
+        for t_row in table:
+            try:
+                name, description, type_, example = t_row
+            except ValueError as e:
+                Actor.log.error(f"Failed to parse table row {t_row.tag}: {e}")
+                continue
+
+            parameters.append(opy.Parameter(
+                name=name,
+                param_in=param_in,
+                description=description,
+                schema=opy.Schema(
+                    type=type_.lower(),
+                    example=example
+                )
+            ))
+        return parameters
+
 @dataclass
 class Path:
     summary: str
     description: str
     operation: str
     path: str
+    parameters: List[opy.Parameter]
 
     @classmethod
     def parse(cls, title_tag: Tag, openapi: OpenAPI) -> Self:
@@ -109,7 +182,9 @@ class Path:
         request_description_div_tag = toggle_content_tag.find('div', attrs={'data-toggle-content-target': 'content'})
         assert isinstance(request_description_div_tag, Tag), "Request description div tag should be a Tag instance"
 
-        return cls(summary=title, description=description, operation=operation, path=path)
+        parameters = parse_request_description_div_tag(request_description_div_tag, openapi)
+
+        return cls(summary=title, description=description, operation=operation, path=path, parameters=parameters)
 
     def fill_openapi(self, openapi: OpenAPI, tag_name:str, entity_name: str) -> None:
         """Fills the OpenAPI object with the method data."""
@@ -124,6 +199,7 @@ class Path:
                 summary=self.summary,
                 description=self.description,
                 tags=[entity_name],
+                parameters=self.parameters,
                 responses={
                     "200": opy.Response(
                         description="Successful response",
@@ -140,7 +216,7 @@ class Path:
         openapi.paths[self.path] = path_item
 
 
-async def parse_article(article_tag: Tag, openapi: OpenAPI) -> None:
+async def parse_article(page: BeautifulSoup, article_tag: Tag, openapi: OpenAPI) -> None:
     """Parses an article tag to extract the API path and operations."""
     Actor.log.info(f"Parsing article {article_tag}")
     title = article_tag.parent.h1.text.strip()
@@ -160,7 +236,7 @@ async def parse_article(article_tag: Tag, openapi: OpenAPI) -> None:
     Actor.log.info(f"Found subobjects to parse {subobjects_headings_tags}")
     Actor.log.info(f"Found requests to parse {requests_headings_tags}")
 
-    parse_attributes_table(attribs_table, title, openapi)
+    parse_attributes_table(page, attribs_table, title, openapi)
     # https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.0.4.md#components-object
     for heading_tag in requests_headings_tags:
         assert isinstance(heading_tag, Tag), "Heading tag should be a Tag instance"
@@ -179,7 +255,7 @@ async def parse_page(client: AsyncClient, url: str, openapi: OpenAPI):
     soup: BeautifulSoup = BeautifulSoup(response.content, 'lxml')
 
     api_article_div = soup.find(class_="api-article") 
-    await parse_article(api_article_div, openapi)
+    await parse_article(soup, api_article_div, openapi)
 
 SIMPLE_TYPES: Dict[str, Tuple[opy.DataType, str|None]] = {
     'String': (opy.DataType.STRING, None),
@@ -198,7 +274,7 @@ def dereference(object_name: str):
     return object_name.lstrip('#')
 
 
-def parse_attributes_table(table: BeautifulSoup, group_name: str, openapi: opy.OpenAPI) -> None:
+def parse_attributes_table(page: BeautifulSoup, table: BeautifulSoup, group_name: str, openapi: opy.OpenAPI) -> None:
     schema = opy.Schema(
         type=opy.DataType.OBJECT,
         description="This schema is web-scraped from Fakturoid API documentation.",
@@ -227,9 +303,24 @@ def parse_attributes_table(table: BeautifulSoup, group_name: str, openapi: opy.O
         items = None
         prop_format = None
         if len(soup_type_strings) == 3 and soup_type_strings == ['Array[', 'Object', ']']:
-            prop_obj_type = dereference(type_td.code.a.attrs['href'])
-            prop_type = opy.DataType.ARRAY
-            items = opy.Reference(ref=f'#/components/schemas/{prop_obj_type}')
+            if type_td.code.a['href'] == '#eet-records':
+                Actor.log.info("Skipping eet records, they are not supported by Fakturoid API.")
+                items = opy.Reference(ref='#/components/schemas/EET Records')
+            elif type_td.code.a['href'] == '/api/v3/invoice-payments':
+                Actor.log.info("Skipping invoice payments, they are not supported by Fakturoid API.")
+                items = opy.Reference(ref='#/components/schemas/Invoice Payments')
+            elif type_td.code.a['href'] == '/api/v3/expense-payments':
+                Actor.log.info("Skipping expense payments, they are not supported by Fakturoid API.")
+                items = opy.Reference(ref='#/components/schemas/Expense Payments')
+            elif type_td.code.a['href'] == '#attachments':
+                Actor.log.info("Skipping attachments, they are not supported by Fakturoid API.")
+                items = opy.Reference(ref='#/components/schemas/Attachments')
+            else:
+                table = find_subattrs_table(page, type_td.code.a['href'])
+                title = table.find_previous('h2').text.strip()
+                parse_attributes_table(page, table, title, openapi)
+                prop_type = opy.DataType.ARRAY
+                items = opy.Reference(ref=f'#/components/schemas/{title}')
         elif len(soup_type_strings) == 1:
             resolved_type = SIMPLE_TYPES.get(soup_type_strings[0], None)
             if resolved_type == None:
@@ -253,32 +344,14 @@ def parse_attributes_table(table: BeautifulSoup, group_name: str, openapi: opy.O
             schema.properties[prop_name].schema_format = prop_format
         
     openapi.components.schemas[group_name] = schema
-    
 
-def parse_h3_table(h3_tag: Tag, openapi: OpenAPI) -> str:
-    """Parses an h3 tag to extract the API path and operations."""
-    Actor.log.info(f"Parsing h3 {h3_tag}")
-    title = h3_tag.text.strip()
-    table = h3_tag.find_next('table')
-    if not table:
-        Actor.log.warning(f"No table found for {title}")
-        return
 
-    params = parse_table(table)
-    if not params:
-        Actor.log.warning(f"No parameters found in table for {title}")
-        return
+def find_subattrs_table(page: BeautifulSoup, href: str) -> Tag | None:
+    Actor.log.info(f"Finding subattributes table for {href}")
+    retval = page.find(id=href.lstrip('#')).find_next('table')
+    assert retval
+    return retval
 
-    schema = opy.Schema(
-        type=opy.DataType.OBJECT,
-        description="This schema is web-scraped from Fakturoid API documentation.",
-        properties=params,
-        required=list(params.keys())
-    )
-    
-    openapi.components.schemas[title] = schema
-
-    return title
 
 async def main() -> None:
     """Define a main entry point for the Apify Actor.

@@ -112,7 +112,7 @@ PARAMETERS_IN_TABLE = {
 }
 
 
-def parse_request_description_div_tag(request_description_div_tag: Tag, openapi: OpenAPI) -> None:
+async def parse_request_description_div_tag(request_description_div_tag: Tag, openapi: OpenAPI) -> None:
     heading: str
     table: Tag
     parameters: List[opy.Parameter] = []
@@ -138,16 +138,31 @@ def parse_request_description_div_tag(request_description_div_tag: Tag, openapi:
                 Actor.log.error(f"Failed to parse table row {t_row.tag}: {e}")
                 continue
 
-            parameters.append(opy.Parameter(
-                name=name,
-                param_in=param_in,
-                description=description,
-                schema=opy.Schema(
-                    type=type_.lower(),
-                    example=example
-                )
-            ))
-        return parameters
+            if type_ == 'Array[String]':
+                parameters.append(opy.Parameter(
+                    name=name,
+                    param_in=param_in,
+                    description=description,
+                    schema=opy.Schema(
+                        type=opy.DataType.ARRAY,
+                        items=opy.Schema(type=opy.DataType.STRING),
+                        example=example
+                    )
+                ))
+            else:
+                type_, format = SIMPLE_TYPES.get(type_, None)
+
+                parameters.append(opy.Parameter(
+                    name=name,
+                    param_in=param_in,
+                    description=description,
+                    schema=opy.Schema(
+                        type=type_,
+                        format=format,
+                        example=example,
+                    )
+                ))
+    return parameters
 
 @dataclass
 class Path:
@@ -158,7 +173,7 @@ class Path:
     parameters: List[opy.Parameter]
 
     @classmethod
-    def parse(cls, title_tag: Tag, openapi: OpenAPI) -> Self:
+    async def parse(cls, title_tag: Tag, openapi: OpenAPI) -> Self:
         title: str = title_tag.text.strip()
         description: str
         operation: str
@@ -182,7 +197,7 @@ class Path:
         request_description_div_tag = toggle_content_tag.find('div', attrs={'data-toggle-content-target': 'content'})
         assert isinstance(request_description_div_tag, Tag), "Request description div tag should be a Tag instance"
 
-        parameters = parse_request_description_div_tag(request_description_div_tag, openapi)
+        parameters = await parse_request_description_div_tag(request_description_div_tag, openapi)
 
         return cls(summary=title, description=description, operation=operation, path=path, parameters=parameters)
 
@@ -218,7 +233,6 @@ class Path:
 
 async def parse_article(page: BeautifulSoup, article_tag: Tag, openapi: OpenAPI) -> None:
     """Parses an article tag to extract the API path and operations."""
-    Actor.log.info(f"Parsing article {article_tag}")
     title = article_tag.parent.h1.text.strip()
 
     attributes_heading = article_tag.find(id="attributes")
@@ -241,7 +255,7 @@ async def parse_article(page: BeautifulSoup, article_tag: Tag, openapi: OpenAPI)
     for heading_tag in requests_headings_tags:
         assert isinstance(heading_tag, Tag), "Heading tag should be a Tag instance"
         try:
-            method = Path.parse(heading_tag, openapi)
+            method = await Path.parse(heading_tag, openapi)
             method.fill_openapi(openapi, heading_tag.text.strip(), title)
         except ParseError as e:
             Actor.log.error(f"Failed to parse {heading_tag}: {e}")
@@ -260,6 +274,7 @@ async def parse_page(client: AsyncClient, url: str, openapi: OpenAPI):
 SIMPLE_TYPES: Dict[str, Tuple[opy.DataType, str|None]] = {
     'String': (opy.DataType.STRING, None),
     'Integer': (opy.DataType.INTEGER, None),
+    'Number': (opy.DataType.NUMBER, None),
     'Boolean': (opy.DataType.BOOLEAN, None),
     'DateTime': (opy.DataType.STRING, "date-time"),
     'Datetime': (opy.DataType.STRING, "date-time"),
